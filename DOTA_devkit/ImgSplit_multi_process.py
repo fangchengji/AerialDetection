@@ -14,6 +14,7 @@ import copy
 from multiprocessing import Pool
 from functools import partial
 import time
+from itertools import chain
 
 def choose_best_pointorder_fit_another(poly1, poly2):
     """
@@ -101,15 +102,15 @@ class splitbase():
             polyInsub[i * 2 + 1] = int(poly[i * 2 + 1] - up)
         return polyInsub
 
-    def calchalf_iou(self, poly1, poly2):
+    def calc_intersection(self, poly1, poly2):
         """
             It is not the iou on usual, the iou is the value of intersection over poly1
         """
         inter_poly = poly1.intersection(poly2)
         inter_area = inter_poly.area
         poly1_area = poly1.area
-        half_iou = inter_area / poly1_area
-        return inter_poly, half_iou
+        inter_ratio = inter_area / poly1_area
+        return inter_poly, inter_ratio 
 
     def saveimagepatches(self, img, subimgname, left, up):
         subimg = copy.deepcopy(img[up: (up + self.subsize), left: (left + self.subsize)])
@@ -137,14 +138,156 @@ class splitbase():
             elif (count == (pos + 1)%5):
                 count = count + 1
                 continue
-
             else:
                 outpoly.append(poly[count * 2])
                 outpoly.append(poly[count * 2 + 1])
                 count = count + 1
         return outpoly
 
-    def savepatches(self, resizeimg, objects, subimgname, left, up, right, down):
+    def get_poly4_from_poly5(self, poly):
+        distances = [cal_line_length((poly[i * 2], poly[i * 2 + 1] ), (poly[(i + 1) * 2], poly[(i + 1) * 2 + 1])) for i in range(int(len(poly)/2 - 1))]
+        distances.append(cal_line_length((poly[0], poly[1]), (poly[8], poly[9])))
+        pos = np.array(distances).argsort()[0]
+        count = 0
+        outpoly = []
+        while count < 5:
+            if (count == pos):
+                outpoly.append((poly[count * 2] + poly[(count * 2 + 2)%10])/2)
+                outpoly.append((poly[(count * 2 + 1)%10] + poly[(count * 2 + 3)%10])/2)
+                count = count + 1
+            elif (count == (pos + 1)%5):
+                count = count + 1
+                continue
+            else:
+                outpoly.append(poly[count * 2])
+                outpoly.append(poly[count * 2 + 1])
+                count = count + 1
+        return outpoly, [pos, (pos + 1) % 5]
+
+    def adjust_object(self, inter_poly, obj_poly, vis_flags):
+        # calculate the 2 matched points
+        obj2inter = {}
+        for i, flag in enumerate(vis_flags):
+            if flag == 1:
+                error = []
+                for j in range(len(inter_poly)):
+                    error.append(pow(obj_poly[2 * i] - inter_poly[j][0], 2) + pow(obj_poly[2 * i + 1] - inter_poly[j][1], 2))
+                min_idx = np.array(error).argsort()[0]
+                obj2inter[i] = min_idx
+        assert len(obj2inter) >= 2
+
+        # select the 4 right points 
+        inter_idxes = []
+        if vis_flags[0] == 1 and vis_flags[3] == 1:
+            inter_idxes.append(obj2inter[3] - 1)
+            inter_idxes.append(obj2inter[3])
+            inter_idxes.append(obj2inter[0])
+            inter_idxes.append((obj2inter[0] + 1) % len(inter_poly))
+        else:
+            for i, flag in enumerate(vis_flags):
+                if flag == 1 and vis_flags[i - 1] != 1:
+                    inter_idxes.append(obj2inter[i] - 1)
+                    inter_idxes.append(obj2inter[i])
+                if flag == 1 and vis_flags[i - 1] == 1:
+                    inter_idxes.append(obj2inter[i])
+                    inter_idxes.append((obj2inter[i] + 1) % len(inter_poly))
+        # sort the 4 points as the original order
+        out_poly = list(chain(*[inter_poly[idx] for idx in inter_idxes]))
+        adjusted_poly = choose_best_pointorder_fit_another(out_poly, obj_poly)
+        return adjusted_poly
+
+    def save_patche_points(self, resizeimg, objects, subimgname, left, up, right, down, filter_area=50):
+        outdir = os.path.join(self.outlabelpath, subimgname + '.txt')
+        # mask_poly = []
+        img_poly = shgeo.Polygon([(left, up), (right, up), (right, down),
+                                 (left, down)])
+        with codecs.open(outdir, 'w', self.code) as f_out:
+            for obj in objects:
+                gt_poly = shgeo.Polygon([(obj['poly'][0], obj['poly'][1]),
+                                         (obj['poly'][2], obj['poly'][3]),
+                                         (obj['poly'][4], obj['poly'][5]),
+                                         (obj['poly'][6], obj['poly'][7])])
+
+                inter_poly, inter_ratio = self.calc_intersection(gt_poly, img_poly)
+                # filter the small object
+                if inter_poly.area <= filter_area or inter_ratio < 0.2:
+                    continue
+                
+                vis_flags = []
+                for i in range(4):
+                    if obj['poly'][2 * i] >= left and obj['poly'][2 * i] < right and obj['poly'][2 * i + 1] >= up and obj['poly'][2 * i + 1] < down:
+                        vis_flags.append(1)         # if the point is in the image, set flag 1
+                    else:
+                        vis_flags.append(0)         # if the point is not in the image set flag 0
+
+                if sum(vis_flags) < 2:  # points < 2
+                    continue
+                elif sum(vis_flags) == 2:
+                    inter_poly = shgeo.polygon.orient(inter_poly, sign=1)
+                    out_poly = list(inter_poly.exterior.coords)[0: -1]
+                    out_poly = self.adjust_object(out_poly, obj['poly'], vis_flags)
+                else:       # visible points >= 3
+                    out_poly = obj['poly']
+
+                poly_sub = self.polyorig2sub(left, up, out_poly)
+                outline = ' '.join(list(map(str, poly_sub)))
+                outline += ' ' + ' '.join(list(map(str, vis_flags)))
+
+                if inter_ratio == 1:
+                    # poly_sub = self.polyorig2sub(left, up, obj['poly'])
+                    # outline = ' '.join(list(map(str, poly_sub)))
+                    # outline += ' 1 1 1 1'       # 1 means the keypoint is in the true keypoint
+                    outline = outline + ' ' + obj['name'] + ' ' + str(obj['difficult'])
+                    f_out.write(outline + '\n')
+                else:   
+                    # inter_poly = shgeo.polygon.orient(inter_poly, sign=1)
+                    # out_poly = list(inter_poly.exterior.coords)[0: -1]
+                    # if len(out_poly) < 4:
+                    #     continue
+
+                    # out_poly2 = []
+                    # vis_flags = []
+                    # for i in range(len(out_poly)):
+                    #     out_poly2.append(out_poly[i][0])
+                    #     out_poly2.append(out_poly[i][1])
+                    #     vis_flag = 0
+                    #     for j in range(4):
+                    #         error = pow(out_poly[i][0] - obj['poly'][2*j], 2) + \
+                    #                 pow(out_poly[i][1] - obj['poly'][2 * j + 1], 2)
+                    #         if error < 2.0:
+                    #             vis_flag = 1
+                    #             break
+                    #     vis_flags.append(vis_flag)
+                    
+                    # if sum(vis_flags) < 2:  # points < 2
+                    #     continue
+
+                    # if len(out_poly) == 5:
+                    #     out_poly2, merged_idxes = self.get_poly4_from_poly5(out_poly2)
+                    # # elif (len(out_poly) > 5):
+                    # #     continue
+                    # if self.choosebestpoint:
+                    #     out_poly2 = choose_best_pointorder_fit_another(out_poly2, obj['poly'])
+
+                    # poly_sub = self.polyorig2sub(left, up, out_poly2)
+
+                    # for index, item in enumerate(poly_sub):
+                    #     if (item <= 1):
+                    #         poly_sub[index] = 1
+                    #     elif (item >= self.subsize):
+                    #         poly_sub[index] = self.subsize
+                    # outline = ' '.join(list(map(str, poly_sub)))
+                    # outline += ' ' + ' '.join(list(map(str, vis_flags)))
+
+                    if (inter_ratio > self.thresh):
+                        outline = outline + ' ' + obj['name'] + ' ' + str(obj['difficult'])
+                    else:
+                        outline = outline + ' ' + obj['name'] + ' ' + '2'
+                    f_out.write(outline + '\n')
+
+        self.saveimagepatches(resizeimg, subimgname, left, up)
+
+    def savepatches(self, resizeimg, objects, subimgname, left, up, right, down, filter_area=50):
         outdir = os.path.join(self.outlabelpath, subimgname + '.txt')
         mask_poly = []
         imgpoly = shgeo.Polygon([(left, up), (right, up), (right, down),
@@ -155,9 +298,9 @@ class splitbase():
                                          (obj['poly'][2], obj['poly'][3]),
                                          (obj['poly'][4], obj['poly'][5]),
                                          (obj['poly'][6], obj['poly'][7])])
-                if (gtpoly.area <= 0):
+                if (gtpoly.area <= filter_area):
                     continue
-                inter_poly, half_iou = self.calchalf_iou(gtpoly, imgpoly)
+                inter_poly, half_iou = self.calc_intersection(gtpoly, imgpoly)
 
                 # print('writing...')
                 if (half_iou == 1):
@@ -233,30 +376,31 @@ class splitbase():
         else:
             resizeimg = img
         outbasename = name + '__' + str(rate) + '__'
-        weight = np.shape(resizeimg)[1]
+        width = np.shape(resizeimg)[1]
         height = np.shape(resizeimg)[0]
 
-        # if (max(weight, height) < self.subsize):
+        # if (max(width, height) < self.subsize):
         #     return
 
         left, up = 0, 0
-        while (left < weight):
-            if (left + self.subsize >= weight):
-                left = max(weight - self.subsize, 0)
+        while (left < width):
+            if (left + self.subsize >= width):
+                left = max(width - self.subsize, 0)
             up = 0
             while (up < height):
                 if (up + self.subsize >= height):
                     up = max(height - self.subsize, 0)
-                right = min(left + self.subsize, weight - 1)
+                right = min(left + self.subsize, width - 1)
                 down = min(up + self.subsize, height - 1)
                 subimgname = outbasename + str(left) + '___' + str(up)
                 # self.f_sub.write(name + ' ' + subimgname + ' ' + str(left) + ' ' + str(up) + '\n')
-                self.savepatches(resizeimg, objects, subimgname, left, up, right, down)
+                # self.savepatches(resizeimg, objects, subimgname, left, up, right, down)
+                self.save_patche_points(resizeimg, objects, subimgname, left, up, right, down)
                 if (up + self.subsize >= height):
                     break
                 else:
                     up = up + self.slide
-            if (left + self.subsize >= weight):
+            if (left + self.subsize >= width):
                 break
             else:
                 left = left + self.slide
@@ -282,6 +426,7 @@ class splitbase():
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+
 if __name__ == '__main__':
     # example usage of ImgSplit
     # start = time.clock()

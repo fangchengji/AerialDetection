@@ -6,6 +6,7 @@ import os
 import re
 import math
 # import polyiou
+from itertools import chain
 """
     some basic functions which are useful for process DOTA data
 """
@@ -162,6 +163,113 @@ def parse_dota_poly2(filename):
     for obj in objects:
         obj['poly'] = TuplePoly2Poly(obj['poly'])
         obj['poly'] = list(map(int, obj['poly']))
+    return objects
+
+
+def distance(point1, point2):
+    return math.sqrt(pow(point1[0] - point2[0], 2) + pow(point1[1] - point2[1], 2))
+
+def points2rotate_box(points, visibility):
+    '''
+        calculate the rotated box according to points and visibility
+    '''
+    # points = np.array(points, dtype=np.float32)
+    # calculate angle
+    if visibility[0] == 0 and visibility[1] == 0:
+        # todo: use 2, 3,  arctan2((y3 - y2) / (x2 - x3))
+        angle = np.arctan2(points[7] - points[5], points[4] - points[6])
+    else:    # calculate angle by #1,2 points,  arctan2((y0 - y1) / (x1 - x0))
+        angle = np.arctan2((points[1] - points[3]),points[2] - points[0])
+        
+    # calculate width and height
+    keep = np.array(visibility, dtype=np.int32)
+    if visibility[0] + visibility[1] == 2 or visibility[2] + visibility[3] == 2:
+        height1 = distance((points[0], points[1]), (points[6], points[7]))
+        height2 = distance((points[2], points[3]), (points[4], points[5]))
+        if height1 > height2:
+            keep[0] = 1
+            keep[3] = 1
+        else:
+            keep[1] = 1
+            keep[2] = 1
+        height = max(height1, height2)
+        width = distance((points[0], points[1]), (points[2], points[3])) if visibility[0] == 1 \
+            else distance((points[4], points[5]), (points[6], points[7]))
+    elif visibility[0] + visibility[3] == 2 or visibility[1] + visibility[2] == 2:
+        width1 = distance((points[0], points[1]), (points[2], points[3]))
+        width2 = distance((points[4], points[5]), (points[6], points[7]))
+        if width1 > width2:
+            keep[0] = 1
+            keep[1] = 1
+        else:
+            keep[2] = 1
+            keep[3] = 1
+        width = max(width1, width2)
+        height = distance((points[0], points[1]), (points[6], points[7])) if visibility[0] == 1 \
+            else distance((points[2], points[3]), (points[4], points[5]))
+    else:
+        raise Exception("Exception occured when calculate rotate box!!")
+        
+    assert np.sum(keep) >= 3
+    if keep[0] == 0 or keep[2] == 0:
+        center_x = (points[2] + points[6]) / 2.0
+        center_y = (points[3] + points[7]) / 2.0
+    else:
+        center_x = (points[0] + points[4]) / 2.0
+        center_y = (points[1] + points[5]) / 2.0
+    
+    return center_x, center_y, width, height, angle
+
+def parse_dota_rotated_bbox(filename, img_size):
+    """
+        parse the dota ground truth in the format:
+        [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+    """
+    objects = []
+    f = []
+    fd = open(filename, 'r')
+    f = fd
+    img_height, img_width = img_size
+    # count = 0
+    while True:
+        line = f.readline()
+        # count = count + 1
+        # if count < 2:
+        #     continue
+        if line:
+            try:
+                splitlines = line.strip().split(' ')
+                object_struct = {}
+                ### clear the wrong name after check all the data
+                #if (len(splitlines) >= 9) and (splitlines[8] in classname):
+                if len(splitlines) < 14:
+                    continue
+
+                object_struct['name'] = splitlines[-2]
+                object_struct['difficult'] = splitlines[-1]
+                
+                assert (len(splitlines) - 2) % 3 == 0
+                num_points = (len(splitlines) - 2) // 3
+                object_struct['poly'] = []
+                object_struct['visibility'] = []
+                for i in range(num_points):
+                    object_struct['poly'].append((float(splitlines[2 * i]), float(splitlines[2 * i + 1])))
+                    object_struct['visibility'].append(int(splitlines[2 * num_points + i]))
+
+                gtpoly = shgeo.Polygon(object_struct['poly'])
+                img_poly = shgeo.Polygon([(0, 0), (img_width, 0), (img_width, img_height), (0, img_height)])
+                # print(gtpoly, img_poly)
+                # There is a bug when the poly is wrong because of the counter-clock wise points annotation.
+                inter_poly = gtpoly.intersection(img_poly)
+                object_struct['area'] = inter_poly.area
+
+                object_struct['poly'] = list(chain(*object_struct['poly']))
+                object_struct['rotated_bbox'] = points2rotate_box(object_struct['poly'], object_struct['visibility'])
+                objects.append(object_struct)
+            except:
+                print(f'Error occured when parsing {filename} ...')
+        else:
+            break
     return objects
 
 def parse_dota_rec(filename):
